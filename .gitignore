@@ -1,0 +1,21 @@
+# Ambientes Virtuais
+venv/
+env/
+.env
+
+# Arquivos gerados
+*.csv
+*.jsonlines
+*.json
+
+# Cache do Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# Scrapy (caso o usuário volte a usar)
+.scrapy/
+
+# Playwright (se tiver dependências locais)
+.playwright/
