@@ -7,20 +7,21 @@ import random
 import re
 import sys
 import urllib.parse
+from datetime import datetime
+from pymongo import MongoClient
 
 # ============================================================================
-# CONFIGURAÇÕES DO ROBÔ
+# CONFIGURAÇÃO DO MONGODB
 # ============================================================================
-# Mude para True se quiser entrar em cada anúncio para pegar
-# Telefone, Descrição Completa e Nome do Anunciante.
-PEGAR_DETALHES_PROFUNDOS = True
-
-# Limite de anúncios para buscar detalhes profundos (para testes).
-# Use None para buscar TODOS, ou um número como 10, 50, 100.
-LIMITE_DETALHES = 20
-
-# Quantidade máxima de páginas de busca (OLX limita a 100)
-PAGINAS_BUSCA = 5  # Mude para 100 quando quiser rodar tudo
+# Conecta ao MongoDB local
+try:
+    mongo_client = MongoClient("mongodb://127.0.0.1:27017/", serverSelectionTimeoutMS=2000)
+    db = mongo_client["olx_extractor"]
+    anuncios_col = db["anuncios"]
+    extractions_col = db["extractions"]
+except Exception as e:
+    print(f"Erro ao conectar no MongoDB: {e}")
+    mongo_client = None
 
 # ============================================================================
 # DICIONÁRIO DDD → ESTADO (adaptado do pyolxbrazil)
@@ -230,18 +231,30 @@ def extrair_detalhes_anuncio(session, url):
 # FUNÇÃO PRINCIPAL
 # ============================================================================
 
-def scrape_olx(termo_busca, estado):
+def scrape_olx(termo_busca, estado, paginas_busca=5, modo_profundo=True, limite_detalhes=20, job_id=None):
     print("=" * 60)
     print("  ROBÔ OLX BRASIL - Extrator de Anúncios")
     print("=" * 60)
     print(f"  Buscando por : {termo_busca.upper()}")
     print(f"  Estado       : {estado.upper()}")
-    print(f"  Modo         : {'PROFUNDO (detalhes de cada anúncio)' if PEGAR_DETALHES_PROFUNDOS else 'RÁPIDO (apenas lista)'}")
-    if PEGAR_DETALHES_PROFUNDOS and LIMITE_DETALHES:
-        print(f"  Limite prof. : {LIMITE_DETALHES} anúncios")
-    print(f"  Páginas máx. : {PAGINAS_BUSCA}")
+    print(f"  Modo         : {'PROFUNDO (detalhes de cada anúncio)' if modo_profundo else 'RÁPIDO (apenas lista)'}")
+    if modo_profundo and limite_detalhes:
+        print(f"  Limite prof. : {limite_detalhes} anúncios")
+    print(f"  Páginas máx. : {paginas_busca}")
     print("=" * 60)
     print()
+
+    # Função auxiliar para atualizar o MongoDB com o status do Job
+    def update_job_status(status_info):
+        if job_id and mongo_client:
+            try:
+                extractions_col.update_one(
+                    {"job_id": job_id},
+                    {"$set": status_info},
+                    upsert=True
+                )
+            except Exception as e:
+                print(f"Erro ao atualizar status do job: {e}")
 
     # Formata a URL de acordo com a pesquisa
     termo_url = urllib.parse.quote(termo_busca)
@@ -271,7 +284,7 @@ def scrape_olx(termo_busca, estado):
         'date',
     ]
 
-    if PEGAR_DETALHES_PROFUNDOS:
+    if modo_profundo:
         campos += ['description', 'author', 'phone', 'detail_status']
 
     total_anuncios = 0
@@ -294,9 +307,20 @@ def scrape_olx(termo_busca, estado):
         f_csv.flush()
 
         # ---- FASE 1: Raspar as páginas de busca ----
-        for i in range(1, PAGINAS_BUSCA + 1):
+        for i in range(1, paginas_busca + 1):
             url = url_base_template.format(pagina=i)
-            print(f"[BUSCA] Raspando página {i} de {PAGINAS_BUSCA}...")
+            print(f"[BUSCA] Raspando página {i} de {paginas_busca}...")
+            
+            # Atualiza progresso (Scraping = até 45%)
+            progresso_atual = int((i / paginas_busca) * 45)
+            update_job_status({
+                "status": "scraping",
+                "progress": progresso_atual,
+                "message": f"Raspando página {i} de {paginas_busca} da OLX...",
+                "totalAnuncios": total_anuncios,
+                "detalhesColetados": detalhes_coletados,
+                "duplicadosRemovidos": total_duplicados
+            })
 
             try:
                 response = session.get(url, timeout=15)
@@ -371,11 +395,23 @@ def scrape_olx(termo_busca, estado):
                     }
 
                     # Se modo profundo está ligado, busca detalhes agora
-                    if PEGAR_DETALHES_PROFUNDOS:
-                        pode_buscar = (LIMITE_DETALHES is None or detalhes_coletados < LIMITE_DETALHES)
+                    if modo_profundo:
+                        pode_buscar = (limite_detalhes is None or detalhes_coletados < limite_detalhes)
 
                         if pode_buscar and row['url']:
                             print(f"    [>>] Detalhe [{detalhes_coletados + 1}] {row['title'][:50]}...")
+                            
+                            # Atualiza status visual para os detalhes (progresso 45% -> 90%)
+                            prog_detalhe = 45 + int((detalhes_coletados / limite_detalhes) * 45) if limite_detalhes else 60
+                            update_job_status({
+                                "status": "details",
+                                "progress": min(prog_detalhe, 90),
+                                "message": f"Coletando detalhes do anúncio {detalhes_coletados + 1}...",
+                                "totalAnuncios": total_anuncios,
+                                "detalhesColetados": detalhes_coletados,
+                                "duplicadosRemovidos": total_duplicados
+                            })
+                            
                             detalhes = extrair_detalhes_anuncio(session, row['url'])
                             row.update(detalhes)
                             detalhes_coletados += 1
@@ -388,11 +424,27 @@ def scrape_olx(termo_busca, estado):
                             row['phone'] = ''
                             row['detail_status'] = 'pulado' if not pode_buscar else 'sem_url'
 
-                    # Salva incrementalmente (cada anúncio é salvo de imediato)
+                    # Salva incrementalmente no CSV e JSONL
                     writer.writerow(row)
                     f_csv.flush()
                     f_json.write(json.dumps(row, ensure_ascii=False) + '\n')
                     f_json.flush()
+
+                    # Salva no MongoDB (Faz upsert para não duplicar caso o list_id já exista)
+                    if mongo_client:
+                        try:
+                            # Prepara o doc, adiciona timestamp de captura e job_id
+                            doc = row.copy()
+                            doc["_captured_at"] = datetime.now()
+                            if job_id:
+                                doc["job_id"] = job_id
+                            anuncios_col.update_one(
+                                {"list_id": list_id},
+                                {"$set": doc},
+                                upsert=True
+                            )
+                        except Exception as e:
+                            print(f"Erro ao salvar no MongoDB: {e}")
 
                     total_anuncios += 1
 
@@ -415,17 +467,27 @@ def scrape_olx(termo_busca, estado):
     print("=" * 60)
     print(f"  Total de anúncios salvos: {total_anuncios}")
     print(f"  Duplicados removidos: {total_duplicados}")
-    if PEGAR_DETALHES_PROFUNDOS:
+    if modo_profundo:
         print(f"  Detalhes profundos coletados: {detalhes_coletados}")
     print(f"  Arquivo CSV: {arquivo_csv}")
     print(f"  Arquivo JSONLines: {arquivo_json}")
     print("=" * 60)
+    # Atualiza o status final no MongoDB com os números totais
+    update_job_status({
+        "totalAnuncios": total_anuncios,
+        "detalhesColetados": detalhes_coletados,
+        "duplicadosRemovidos": total_duplicados
+    })
+    
+    return arquivo_csv
 
 
 if __name__ == '__main__':
     print("\n" + "=" * 60)
     print("  BEM-VINDO AO ROBÔ OLX!")
     print("=" * 60)
+    
+    # Se rodar direto pelo terminal, usamos os valores padrão da CLI
     termo = input("O que você deseja buscar? (ex: celular, notebook, carro): ").strip()
     if not termo:
         termo = "imoveis"
@@ -435,4 +497,4 @@ if __name__ == '__main__':
         estado = "brasil"
         
     print("\nIniciando...")
-    scrape_olx(termo, estado)
+    scrape_olx(termo, estado, paginas_busca=5, modo_profundo=True, limite_detalhes=20)

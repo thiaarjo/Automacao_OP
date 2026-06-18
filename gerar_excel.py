@@ -3,7 +3,7 @@ Converte os resultados do scraper OLX (CSV) em uma planilha Excel formatada.
 Rode este script DEPOIS de rodar o olx.py.
 
 Uso:
-    .\olx_scraper\venv\Scripts\python.exe gerar_excel.py
+    .\\olx_scraper\\venv\\Scripts\\python.exe gerar_excel.py
 """
 import csv
 import re
@@ -36,18 +36,13 @@ def converter_timestamp(ts_str):
         return ts_str
 
 
-def gerar_excel():
-    # Encontra o CSV mais recente na pasta
-    arquivos_csv = glob.glob('resultados_*.csv')
-    if not arquivos_csv:
-        print("Nenhum arquivo CSV encontrado! Rode o olx.py primeiro.")
-        return
+def gerar_excel(arquivo_csv):
+    if not os.path.exists(arquivo_csv):
+        print(f"Arquivo {arquivo_csv} não encontrado.")
+        return None
 
-    # Pega o arquivo modificado mais recentemente
-    arquivo_csv = max(arquivos_csv, key=os.path.getmtime)
     arquivo_excel = arquivo_csv.replace('.csv', '.xlsx')
-
-    print(f"Lendo o arquivo mais recente: {arquivo_csv}")
+    print(f"Gerando Excel para: {arquivo_csv}")
 
     # --- Le o CSV ---
     with open(arquivo_csv, 'r', encoding='utf-8-sig') as f:
@@ -177,7 +172,15 @@ def gerar_excel():
     print(f"\nPlanilha Excel gerada com sucesso!")
     print(f"Arquivo: {arquivo_excel}")
     print(f"Total de linhas: {len(linhas)}")
+    
+    return arquivo_excel
 
 
 if __name__ == '__main__':
-    gerar_excel()
+    # Teste rápido se rodar direto
+    arquivos_csv = glob.glob('resultados_*.csv')
+    if arquivos_csv:
+        arquivo_recente = max(arquivos_csv, key=os.path.getmtime)
+        gerar_excel(arquivo_recente)
+    else:
+        print("Nenhum arquivo CSV encontrado.")
