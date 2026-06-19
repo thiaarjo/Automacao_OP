@@ -53,7 +53,7 @@ def _serialize_datetime(doc):
 
 def _get_anuncios_for_job(job_id: str):
     """Busca anúncios de um job específico e serializa."""
-    docs = list(anuncios_col.find({"job_id": job_id}, {"_id": 0}))
+    docs = list(anuncios_col.find({"extractionIds": job_id}, {"_id": 0}))
     for d in docs:
         _serialize_datetime(d)
     return docs
@@ -209,6 +209,9 @@ def list_extractions():
         raise HTTPException(status_code=500, detail="MongoDB não conectado")
 
     jobs = list(extractions_col.find({}, {"_id": 0}).sort("createdAt", -1).limit(50))
+    for j in jobs:
+        # Indica ao frontend se existem anúncios disponíveis para essa extração
+        j["hasAnuncios"] = anuncios_col.count_documents({"extractionIds": j.get("job_id")}) > 0
     return jobs
 
 

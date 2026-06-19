@@ -439,7 +439,7 @@ def scrape_olx(termo_busca, estado, paginas_busca=5, modo_profundo=True, limite_
                             doc = row.copy()
                             doc["lastSeenAt"] = now.isoformat()
                             if job_id:
-                                doc["job_id"] = job_id
+                                doc["lastExtractionId"] = job_id
 
                             # Upsert: firstSeenAt só no insert, extractionIds acumula
                             update_ops = {
