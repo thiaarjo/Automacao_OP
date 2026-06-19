@@ -63,10 +63,17 @@ def _serialize_datetime(doc):
 
 
 def _get_anuncios_for_job(job_id: str):
-    """Busca anúncios de um job específico e serializa."""
+    """Busca anúncios de um job específico e serializa para o formato esperado pelo frontend."""
     docs = list(anuncios_col.find({"extractionIds": job_id}, {"_id": 0}))
     for d in docs:
         _serialize_datetime(d)
+        
+        # Normalização para camelCase exigida pelo frontend
+        if "list_id" in d:
+            d["listId"] = d.pop("list_id")
+        if "detail_status" in d:
+            d["detailStatus"] = d.pop("detail_status")
+            
     return docs
 
 
@@ -99,7 +106,7 @@ def run_extraction_task(req: ExtractRequest, job_id: str):
 
     try:
         # 1. Roda o scraper
-        csv_file = scrape_olx(
+        result = scrape_olx(
             termo_busca=req.termoBusca,
             estado=req.estado,
             paginas_busca=req.paginasBusca,
@@ -108,6 +115,7 @@ def run_extraction_task(req: ExtractRequest, job_id: str):
             job_id=job_id,
             redis_conn=redis_client
         )
+        csv_file = result.get("csv_file")
 
         # 2. Atualiza status para geração
         if redis_client:
@@ -144,6 +152,9 @@ def run_extraction_task(req: ExtractRequest, job_id: str):
                     "status": "completed",
                     "progress": 100,
                     "message": "Extração concluída com sucesso",
+                    "totalAnuncios": result.get("totalAnuncios", 0),
+                    "detalhesColetados": result.get("detalhesColetados", 0),
+                    "duplicadosRemovidos": result.get("duplicadosRemovidos", 0),
                     "csvFile": csv_file,
                     "excelFile": excel_file,
                     "downloadUrl": f"/api/download/{excel_file}",
@@ -229,7 +240,38 @@ def start_extraction(req: ExtractRequest, background_tasks: BackgroundTasks):
 
 
 # =============================================================================
-# CONSULTAR STATUS DE UM JOB
+# CONSULTAR STATUS DE TODOS OS JOBS ATIVOS (Redis)
+# =============================================================================
+@app.get("/extract/status")
+@app.get("/api/extract/status")
+def list_active_statuses():
+    """Retorna a lista de todos os jobs ativos no Redis."""
+    if not redis_client:
+        return []
+
+    keys = redis_client.keys("job:*:status") if False else redis_client.keys("job:*")
+    # Filtra chaves que contêm exatamente 2 partes (job:{id}) para evitar outras chaves
+    job_keys = [k for k in keys if len(k.split(":")) == 2]
+    
+    active_jobs = []
+    for k in job_keys:
+        cached_job = redis_client.hgetall(k)
+        if cached_job and cached_job.get("status"):
+            job_id = k.split(":")[1]
+            status = cached_job.get("status")
+            if status not in ["completed", "error"]:
+                cached_job["progress"] = int(cached_job.get("progress", 0))
+                cached_job["totalAnuncios"] = int(cached_job.get("totalAnuncios", 0))
+                cached_job["detalhesColetados"] = int(cached_job.get("detalhesColetados", 0))
+                cached_job["duplicadosRemovidos"] = int(cached_job.get("duplicadosRemovidos", 0))
+                cached_job["job_id"] = job_id
+                active_jobs.append(cached_job)
+
+    return active_jobs
+
+
+# =============================================================================
+# CONSULTAR STATUS DE UM JOB ESPECÍFICO
 # =============================================================================
 @app.get("/extract/status/{job_id}")
 @app.get("/api/extract/status/{job_id}")

@@ -94,12 +94,46 @@ class OlxParser:
 
     @staticmethod
     def get_state_from_ddd(location_str):
-        """Tenta adivinhar o estado pelo DDD contido na string de localização."""
-        match = re.search(r'DDD\s*(\d{2})', location_str)
-        if match:
-            ddd = match.group(1)
+        """Tenta adivinhar o estado pelo DDD ou UF na string de localização."""
+        match_uf = re.search(r'\s-\s*([A-Za-z]{2})(?:\s|$)', location_str)
+        if match_uf:
+            uf = match_uf.group(1).lower()
+            return uf
+
+        match_ddd = re.search(r'DDD\s*(\d{2})', location_str)
+        if match_ddd:
+            ddd = match_ddd.group(1)
             return STATES_DDD.get(ddd, '')
         return ''
+
+    @staticmethod
+    def parse_price(price_str):
+        """Converte string de preço (ex: 'R$ 2.400') para número."""
+        if not price_str or "combinar" in price_str.lower():
+            return None
+        
+        # Remove R$, espaços e pontos de milhar, troca vírgula por ponto
+        limpo = price_str.replace("R$", "").replace(".", "").replace(" ", "").replace(",", ".")
+        try:
+            # Se for só inteiro (sem casas decimais na original ou depois do split)
+            if float(limpo) == int(float(limpo)):
+                return int(float(limpo))
+            return float(limpo)
+        except ValueError:
+            return None
+
+    @staticmethod
+    def parse_date(date_str):
+        """Converte unix timestamp (1781720296) para string ISO."""
+        if not date_str:
+            return ""
+        try:
+            # Testa se é só numero (unix timestamp)
+            if str(date_str).isdigit():
+                return datetime.fromtimestamp(int(date_str)).isoformat()
+            return str(date_str)
+        except Exception:
+            return str(date_str)
 
     @staticmethod
     def parse_next_data(script_content):
@@ -191,7 +225,7 @@ class StorageManager:
         # Arquivos abertos
         self.f_csv = open(self.arquivo_csv, 'w', newline='', encoding='utf-8-sig')
         self.f_json = open(self.arquivo_json, 'w', encoding='utf-8')
-        self.writer = csv.DictWriter(self.f_csv, fieldnames=self.campos)
+        self.writer = csv.DictWriter(self.f_csv, fieldnames=self.campos, extrasaction='ignore')
         self.writer.writeheader()
         self.f_csv.flush()
 
@@ -390,25 +424,33 @@ class OlxScraper:
                         if not titulo: continue
 
                         list_id = OlxParser.safe_str(anuncio.get('listId') or anuncio.get('list_id'))
-                        preco_str = OlxParser.safe_str(anuncio.get('price'))
+                        preco_raw = OlxParser.safe_str(anuncio.get('price'))
+                        preco_num = OlxParser.parse_price(preco_raw)
 
-                        if self.storage.is_duplicate(list_id, titulo, preco_str):
+                        if self.storage.is_duplicate(list_id, titulo, preco_raw):
                             continue
 
                         location_raw = anuncio.get('location')
                         location_str, cidade, bairro = OlxParser.extract_location(location_raw)
                         estado_anuncio = OlxParser.get_state_from_ddd(location_str)
+                        if not estado_anuncio:
+                            estado_anuncio = self.estado
+
+                        data_raw = OlxParser.safe_str(anuncio.get('date'))
+                        data_iso = OlxParser.parse_date(data_raw)
 
                         row = {
                             'title': OlxParser.safe_str(titulo),
-                            'price': preco_str,
+                            'price': preco_num if preco_num is not None else 0, # Usado por front-end numérico
+                            'priceRaw': preco_raw,
                             'location': location_str,
                             'city': cidade,
                             'neighborhood': bairro,
                             'state': estado_anuncio,
                             'url': OlxParser.safe_str(anuncio.get('url')),
                             'list_id': list_id,
-                            'date': OlxParser.safe_str(anuncio.get('date')),
+                            'date': data_iso,
+                            'dateRaw': data_raw,
                         }
 
                         if self.modo_profundo:
@@ -434,7 +476,13 @@ class OlxScraper:
 
         # Status Final
         self.storage.update_job_status({"progress": 90, "message": "Finalizando scraper..."})
-        return self.storage.arquivo_csv
+        return {
+            "csv_file": self.storage.arquivo_csv,
+            "jsonl_file": self.storage.arquivo_json,
+            "totalAnuncios": self.storage.total_anuncios,
+            "detalhesColetados": self.storage.detalhes_coletados,
+            "duplicadosRemovidos": self.storage.total_duplicados
+        }
 
 
 # ============================================================================
