@@ -35,6 +35,17 @@ except Exception as e:
     mongo_client = None
     mongo_connected = False
 
+# Conexão Redis
+try:
+    import redis
+    redis_client = redis.Redis(host='127.0.0.1', port=6379, db=0, decode_responses=True)
+    redis_client.ping()
+    redis_connected = True
+except Exception as e:
+    print(f"Erro ao conectar no Redis em app.py: {e}")
+    redis_client = None
+    redis_connected = False
+
 class ExtractRequest(BaseModel):
     termoBusca: str
     estado: str
@@ -62,6 +73,13 @@ def _get_anuncios_for_job(job_id: str):
 def run_extraction_task(req: ExtractRequest, job_id: str):
     now = datetime.now()
 
+    if redis_client:
+        redis_client.hset(f"job:{job_id}", mapping={
+            "status": "preparing",
+            "progress": "10",
+            "message": "Preparando sessão e parâmetros da busca..."
+        })
+
     if mongo_client:
         extractions_col.update_one(
             {"job_id": job_id},
@@ -87,10 +105,18 @@ def run_extraction_task(req: ExtractRequest, job_id: str):
             paginas_busca=req.paginasBusca,
             modo_profundo=req.modoProfundo,
             limite_detalhes=req.limiteDetalhes,
-            job_id=job_id
+            job_id=job_id,
+            redis_conn=redis_client
         )
 
         # 2. Atualiza status para geração
+        if redis_client:
+            redis_client.hset(f"job:{job_id}", mapping={
+                "status": "generating",
+                "progress": "90",
+                "message": "Gerando arquivos CSV compatíveis com Excel..."
+            })
+            
         if mongo_client:
             extractions_col.update_one(
                 {"job_id": job_id},
@@ -106,6 +132,11 @@ def run_extraction_task(req: ExtractRequest, job_id: str):
 
         # 4. Finaliza o Job
         finished = datetime.now()
+        
+        # Apaga o cache efêmero para forçar leitura do Mongo
+        if redis_client:
+            redis_client.delete(f"job:{job_id}")
+
         if mongo_client:
             extractions_col.update_one(
                 {"job_id": job_id},
@@ -121,6 +152,12 @@ def run_extraction_task(req: ExtractRequest, job_id: str):
             )
 
     except Exception as e:
+        if redis_client:
+            redis_client.hset(f"job:{job_id}", mapping={
+                "status": "error",
+                "message": f"Erro: {str(e)}"
+            })
+            
         if mongo_client:
             extractions_col.update_one(
                 {"job_id": job_id},
@@ -142,6 +179,7 @@ def health_check():
     return {
         "status": "ok",
         "mongo": "connected" if mongo_connected else "disconnected",
+        "redis": "connected" if redis_connected else "disconnected",
         "service": "olx-extractor-api"
     }
 
@@ -154,6 +192,18 @@ def health_check():
 def start_extraction(req: ExtractRequest, background_tasks: BackgroundTasks):
     job_id = str(uuid.uuid4())
     now = datetime.now()
+
+    if redis_client:
+        key = f"job:{job_id}"
+        redis_client.hset(key, mapping={
+            "status": "queued",
+            "progress": "0",
+            "message": "Extração iniciada",
+            "totalAnuncios": "0",
+            "detalhesColetados": "0",
+            "duplicadosRemovidos": "0"
+        })
+        redis_client.expire(key, 86400) # Expira em 24h
 
     if mongo_client:
         extractions_col.insert_one({
@@ -184,8 +234,21 @@ def start_extraction(req: ExtractRequest, background_tasks: BackgroundTasks):
 @app.get("/extract/status/{job_id}")
 @app.get("/api/extract/status/{job_id}")
 def get_status(job_id: str):
+    # 1. Tenta pegar o status efêmero do Redis (tempo real)
+    if redis_client:
+        cached_job = redis_client.hgetall(f"job:{job_id}")
+        if cached_job and cached_job.get("status"):
+            # Cast the integer fields so Lovable frontend receives numbers, not strings
+            cached_job["progress"] = int(cached_job.get("progress", 0))
+            cached_job["totalAnuncios"] = int(cached_job.get("totalAnuncios", 0))
+            cached_job["detalhesColetados"] = int(cached_job.get("detalhesColetados", 0))
+            cached_job["duplicadosRemovidos"] = int(cached_job.get("duplicadosRemovidos", 0))
+            cached_job["job_id"] = job_id
+            return cached_job
+
+    # 2. Se não estiver no Redis, ou se não houver Redis conectado, busca no MongoDB (fonte definitiva)
     if not mongo_client:
-        raise HTTPException(status_code=500, detail="MongoDB não conectado")
+        raise HTTPException(status_code=500, detail="Nenhum banco de dados conectado")
 
     job = extractions_col.find_one({"job_id": job_id}, {"_id": 0})
     if not job:
