@@ -19,6 +19,7 @@ try:
     db = mongo_client["olx_extractor"]
     anuncios_col = db["anuncios"]
     extractions_col = db["extractions"]
+    price_history_col = db["price_history"]
 except Exception as e:
     print(f"Erro ao conectar no MongoDB: {e}")
     mongo_client = None
@@ -433,16 +434,37 @@ def scrape_olx(termo_busca, estado, paginas_busca=5, modo_profundo=True, limite_
                     # Salva no MongoDB (Faz upsert para não duplicar caso o list_id já exista)
                     if mongo_client:
                         try:
-                            # Prepara o doc, adiciona timestamp de captura e job_id
+                            now = datetime.now()
+                            # Prepara o doc base
                             doc = row.copy()
-                            doc["_captured_at"] = datetime.now()
+                            doc["lastSeenAt"] = now.isoformat()
                             if job_id:
                                 doc["job_id"] = job_id
+
+                            # Upsert: firstSeenAt só no insert, extractionIds acumula
+                            update_ops = {
+                                "$set": doc,
+                                "$setOnInsert": {"firstSeenAt": now.isoformat()},
+                            }
+                            if job_id:
+                                update_ops["$addToSet"] = {"extractionIds": job_id}
+
                             anuncios_col.update_one(
                                 {"list_id": list_id},
-                                {"$set": doc},
+                                update_ops,
                                 upsert=True
                             )
+
+                            # Salva snapshot de preço no histórico
+                            if job_id and row.get('price'):
+                                price_history_col.insert_one({
+                                    "list_id": list_id,
+                                    "job_id": job_id,
+                                    "termoBusca": termo_busca,
+                                    "estado": estado,
+                                    "price": row['price'],
+                                    "observedAt": now.isoformat()
+                                })
                         except Exception as e:
                             print(f"Erro ao salvar no MongoDB: {e}")
 

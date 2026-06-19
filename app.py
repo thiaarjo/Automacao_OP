@@ -24,11 +24,16 @@ app.add_middleware(
 # Conexão MongoDB
 try:
     mongo_client = MongoClient("mongodb://127.0.0.1:27017/", serverSelectionTimeoutMS=2000)
+    mongo_client.admin.command("ping")  # Testa conexão real
     db = mongo_client["olx_extractor"]
     extractions_col = db["extractions"]
+    anuncios_col = db["anuncios"]
+    price_history_col = db["price_history"]
+    mongo_connected = True
 except Exception as e:
     print(f"Erro ao conectar no MongoDB em app.py: {e}")
     mongo_client = None
+    mongo_connected = False
 
 class ExtractRequest(BaseModel):
     termoBusca: str
@@ -37,7 +42,26 @@ class ExtractRequest(BaseModel):
     modoProfundo: bool = True
     limiteDetalhes: int = 50
 
+
+def _serialize_datetime(doc):
+    """Converte campos datetime para ISO string em um documento."""
+    for key, val in doc.items():
+        if isinstance(val, datetime):
+            doc[key] = val.isoformat()
+    return doc
+
+
+def _get_anuncios_for_job(job_id: str):
+    """Busca anúncios de um job específico e serializa."""
+    docs = list(anuncios_col.find({"job_id": job_id}, {"_id": 0}))
+    for d in docs:
+        _serialize_datetime(d)
+    return docs
+
+
 def run_extraction_task(req: ExtractRequest, job_id: str):
+    now = datetime.now()
+
     if mongo_client:
         extractions_col.update_one(
             {"job_id": job_id},
@@ -50,7 +74,7 @@ def run_extraction_task(req: ExtractRequest, job_id: str):
                 "paginasBusca": req.paginasBusca,
                 "modoProfundo": req.modoProfundo,
                 "limiteDetalhes": req.limiteDetalhes,
-                "data": datetime.now().isoformat()
+                "createdAt": now.isoformat()
             }},
             upsert=True
         )
@@ -81,6 +105,7 @@ def run_extraction_task(req: ExtractRequest, job_id: str):
         excel_file = gerar_excel(csv_file)
 
         # 4. Finaliza o Job
+        finished = datetime.now()
         if mongo_client:
             extractions_col.update_one(
                 {"job_id": job_id},
@@ -90,111 +115,157 @@ def run_extraction_task(req: ExtractRequest, job_id: str):
                     "message": "Extração concluída com sucesso",
                     "csvFile": csv_file,
                     "excelFile": excel_file,
-                    "downloadUrl": f"/api/download/{excel_file}"
+                    "downloadUrl": f"/api/download/{excel_file}",
+                    "finishedAt": finished.isoformat()
                 }}
             )
-            
+
     except Exception as e:
         if mongo_client:
             extractions_col.update_one(
                 {"job_id": job_id},
                 {"$set": {
                     "status": "error",
-                    "message": f"Erro durante a extração: {str(e)}"
+                    "message": f"Erro durante a extração: {str(e)}",
+                    "finishedAt": datetime.now().isoformat()
                 }}
             )
 
+
+# =============================================================================
+# HEALTH CHECK
+# =============================================================================
 @app.get("/")
 @app.get("/health")
-@app.get("/api")
-@app.get("/api/")
 @app.get("/api/health")
 def health_check():
-    return {"status": "ok", "message": "API está online!"}
+    return {
+        "status": "ok",
+        "mongo": "connected" if mongo_connected else "disconnected",
+        "service": "olx-extractor-api"
+    }
 
+
+# =============================================================================
+# CRIAR EXTRAÇÃO
+# =============================================================================
 @app.post("/extract")
 @app.post("/api/extract")
 def start_extraction(req: ExtractRequest, background_tasks: BackgroundTasks):
     job_id = str(uuid.uuid4())
-    
+    now = datetime.now()
+
     if mongo_client:
         extractions_col.insert_one({
             "job_id": job_id,
             "status": "queued",
             "message": "Extração iniciada",
             "progress": 0,
-            "data": datetime.now().isoformat()
+            "termoBusca": req.termoBusca,
+            "estado": req.estado,
+            "paginasBusca": req.paginasBusca,
+            "modoProfundo": req.modoProfundo,
+            "limiteDetalhes": req.limiteDetalhes,
+            "createdAt": now.isoformat()
         })
-        
+
     background_tasks.add_task(run_extraction_task, req, job_id)
-    
+
     return {
         "job_id": job_id,
         "status": "queued",
         "message": "Extração iniciada"
     }
 
+
+# =============================================================================
+# CONSULTAR STATUS DE UM JOB
+# =============================================================================
 @app.get("/extract/status/{job_id}")
 @app.get("/api/extract/status/{job_id}")
 def get_status(job_id: str):
     if not mongo_client:
         raise HTTPException(status_code=500, detail="MongoDB não conectado")
-        
+
     job = extractions_col.find_one({"job_id": job_id}, {"_id": 0})
     if not job:
         raise HTTPException(status_code=404, detail="Job não encontrado")
-        
+
+    # Quando finalizado, inclui a lista completa de anúncios
     if job.get("status") == "completed":
-        anuncios_list = list(db["anuncios"].find({"job_id": job_id}, {"_id": 0}))
-        for a in anuncios_list:
-            if "_captured_at" in a:
-                a["_captured_at"] = a["_captured_at"].isoformat()
-        job["anuncios"] = anuncios_list
-        
+        job["anuncios"] = _get_anuncios_for_job(job_id)
+
     return job
 
-@app.get("/download/{filename}")
-@app.get("/api/download/{filename}")
-def download_excel(filename: str):
-    file_path = os.path.join(os.getcwd(), filename)
-    if not os.path.exists(file_path):
-        raise HTTPException(status_code=404, detail="Arquivo não encontrado")
-        
-    return FileResponse(path=file_path, filename=filename, media_type='application/octet-stream')
 
+# =============================================================================
+# LISTAR HISTÓRICO DE EXTRAÇÕES
+# =============================================================================
 @app.get("/extractions")
 @app.get("/api/extractions")
 def list_extractions():
-    """Lista o histórico de todas as extrações realizadas."""
+    """Retorna o histórico das últimas 50 extrações."""
     if not mongo_client:
         raise HTTPException(status_code=500, detail="MongoDB não conectado")
-    
-    jobs = list(extractions_col.find({}, {"_id": 0}).sort("data", -1).limit(50))
-    return {"extractions": jobs}
 
+    jobs = list(extractions_col.find({}, {"_id": 0}).sort("createdAt", -1).limit(50))
+    return jobs
+
+
+# =============================================================================
+# CARREGAR ÚLTIMA EXTRAÇÃO CONCLUÍDA
+# =============================================================================
 @app.get("/extractions/latest")
 @app.get("/api/extractions/latest")
 def get_latest_extraction():
     """Retorna a última extração concluída com a lista completa de anúncios."""
     if not mongo_client:
         raise HTTPException(status_code=500, detail="MongoDB não conectado")
-    
+
     job = extractions_col.find_one(
         {"status": "completed"},
         {"_id": 0},
-        sort=[("data", -1)]
+        sort=[("createdAt", -1)]
     )
-    
+
     if not job:
         raise HTTPException(status_code=404, detail="Nenhuma extração concluída encontrada")
-    
-    anuncios_list = list(db["anuncios"].find({"job_id": job["job_id"]}, {"_id": 0}))
-    for a in anuncios_list:
-        if "_captured_at" in a:
-            a["_captured_at"] = a["_captured_at"].isoformat()
-    job["anuncios"] = anuncios_list
-    
+
+    job["anuncios"] = _get_anuncios_for_job(job["job_id"])
+
     return job
+
+
+# =============================================================================
+# BUSCAR ANÚNCIOS DE UMA EXTRAÇÃO ESPECÍFICA
+# =============================================================================
+@app.get("/extractions/{job_id}/anuncios")
+@app.get("/api/extractions/{job_id}/anuncios")
+def get_extraction_anuncios(job_id: str):
+    """Retorna os anúncios de uma extração específica."""
+    if not mongo_client:
+        raise HTTPException(status_code=500, detail="MongoDB não conectado")
+
+    # Verifica se o job existe
+    job = extractions_col.find_one({"job_id": job_id}, {"_id": 0})
+    if not job:
+        raise HTTPException(status_code=404, detail="Extração não encontrada")
+
+    return _get_anuncios_for_job(job_id)
+
+
+# =============================================================================
+# DOWNLOAD DE ARQUIVOS
+# =============================================================================
+@app.get("/download/{filename}")
+@app.get("/api/download/{filename}")
+def download_file(filename: str):
+    file_path = os.path.join(os.getcwd(), filename)
+    if not os.path.exists(file_path):
+        raise HTTPException(status_code=404, detail="Arquivo não encontrado")
+
+    return FileResponse(path=file_path, filename=filename, media_type='application/octet-stream')
+
 
 if __name__ == "__main__":
     import uvicorn
