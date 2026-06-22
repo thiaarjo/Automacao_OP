@@ -6,7 +6,8 @@ import time
 import random
 import re
 import urllib.parse
-from datetime import datetime
+from datetime import datetime, timedelta
+import concurrent.futures
 from pymongo import MongoClient
 try:
     import redis
@@ -219,6 +220,9 @@ class StorageManager:
         self.total_anuncios = 0
         self.total_duplicados = 0
         self.detalhes_coletados = 0
+        self.cache_hits = 0
+        self.deep_requests = 0
+        self.deep_errors = 0
         self.ids_vistos = set()
         self.titulos_vistos = set()
 
@@ -255,6 +259,24 @@ class StorageManager:
         self.titulos_vistos.add(chave_titulo)
         return False
 
+    def get_cached_details(self, list_id):
+        if not hasattr(self, 'anuncios_col') or not self.anuncios_col or not list_id:
+            return None
+        doc = self.anuncios_col.find_one({"list_id": list_id}, {"_id": 0, "description": 1, "descricao": 1, "phone": 1, "telefone": 1, "author": 1, "vendedor": 1, "detailsFetchedAt": 1})
+        if doc and doc.get("detailsFetchedAt"):
+            try:
+                fetched_at = datetime.fromisoformat(doc["detailsFetchedAt"])
+                if datetime.now() - fetched_at <= timedelta(days=15):
+                    return {
+                        "description": doc.get("description") or doc.get("descricao") or "",
+                        "phone": doc.get("phone") or doc.get("telefone") or "",
+                        "author": doc.get("author") or doc.get("vendedor") or "",
+                        "detail_status": "cache_hit"
+                    }
+            except Exception:
+                pass
+        return None
+
     def save_anuncio(self, row):
         # Salva em arquivos
         self.writer.writerow(row)
@@ -278,6 +300,12 @@ class StorageManager:
                 }
                 if self.job_id:
                     update_ops["$addToSet"] = {"extractionIds": self.job_id}
+
+                if row.get("detail_status") == "200":
+                    doc["detail_status"] = "ok"
+                    update_ops["$set"]["detailsFetchedAt"] = now.isoformat()
+                elif row.get("detail_status") and row.get("detail_status") != "cache_hit":
+                    doc["detail_status"] = row["detail_status"]
 
                 self.anuncios_col.update_one(
                     {"list_id": row['list_id']},
@@ -432,6 +460,7 @@ class OlxScraper:
                         continue
 
                     paginas_vazias = 0
+                    anuncios_basicos = []
 
                     for anuncio in anuncios:
                         if not anuncio: continue
@@ -468,22 +497,81 @@ class OlxScraper:
                             'date': data_iso,
                             'dateRaw': data_raw,
                         }
+                        anuncios_basicos.append(row)
 
-                        if self.modo_profundo:
-                            if self.check_cancel():
-                                print("  [X] Cancelamento detectado antes dos detalhes.")
-                                is_cancelled = True
-                                break
+                    if self.modo_profundo:
+                        if self.check_cancel():
+                            print("  [X] Cancelamento detectado antes dos detalhes.")
+                            is_cancelled = True
+                            break
 
+                        tarefas_profundas = []
+                        for row in anuncios_basicos:
                             pode_buscar = (self.limite_detalhes is None or self.storage.detalhes_coletados < self.limite_detalhes)
-                            if pode_buscar and row['url']:
-                                detalhes = self.scrape_deep_details(row['url'], row['title'])
-                                row.update(detalhes)
-                                self.storage.detalhes_coletados += 1
-                                time.sleep(random.uniform(2, 5))
-                            else:
+                            if not pode_buscar or not row['url']:
                                 row.update({'description': '', 'author': '', 'phone': '', 'detail_status': 'pulado' if not pode_buscar else 'sem_url'})
+                                continue
+                            
+                            cached = self.storage.get_cached_details(row['list_id'])
+                            if cached:
+                                row.update(cached)
+                                self.storage.cache_hits += 1
+                                self.storage.detalhes_coletados += 1
+                            else:
+                                tarefas_profundas.append(row)
 
+                        if tarefas_profundas:
+                            print(f"    [!] Baixando detalhes de {len(tarefas_profundas)} anúncios em paralelo (Cache hits: {self.storage.cache_hits})...")
+                            prog_detalhe = 45 + int((i / self.paginas_busca) * 45)
+                            self.storage.update_job_status({
+                                "status": "details",
+                                "progress": min(prog_detalhe, 90),
+                                "message": f"Extraindo detalhes de {len(tarefas_profundas)} anúncios em paralelo..."
+                            })
+
+                            block_flag = False
+
+                            def fetch_worker(anuncio_row):
+                                nonlocal block_flag
+                                if self.check_cancel() or block_flag:
+                                    return {'description': '', 'author': '', 'phone': '', 'detail_status': 'blocked_or_cancelled'}
+                                
+                                try:
+                                    # Sessão isolada para evitar crash entre threads
+                                    sess = requests.Session(impersonate="chrome120")
+                                    resp = sess.get(anuncio_row['url'], timeout=15)
+                                    
+                                    if resp.status_code in [403, 429]:
+                                        block_flag = True
+                                        return {'description': '', 'author': '', 'phone': '', 'detail_status': 'blocked_or_rate_limited'}
+                                    if resp.status_code != 200:
+                                        return {'description': '', 'author': '', 'phone': '', 'detail_status': str(resp.status_code)}
+                                        
+                                    return OlxParser.parse_deep_details(resp.text)
+                                except Exception as e:
+                                    return {'description': '', 'author': '', 'phone': '', 'detail_status': 'error'}
+
+                            with concurrent.futures.ThreadPoolExecutor(max_workers=3) as executor:
+                                futures = {executor.submit(fetch_worker, row): row for row in tarefas_profundas}
+                                for future in concurrent.futures.as_completed(futures):
+                                    row = futures[future]
+                                    try:
+                                        resultado = future.result()
+                                        row.update(resultado)
+                                        
+                                        if resultado.get('detail_status') in ['200', 'ok']:
+                                            self.storage.detalhes_coletados += 1
+                                            self.storage.deep_requests += 1
+                                        elif resultado.get('detail_status') == 'error':
+                                            self.storage.deep_errors += 1
+                                    except Exception:
+                                        row.update({'description': '', 'author': '', 'phone': '', 'detail_status': 'error'})
+                                        self.storage.deep_errors += 1
+
+                            time.sleep(random.uniform(2, 5))
+
+                    # Salva tudo de forma sequencial na thread principal
+                    for row in anuncios_basicos:
                         self.storage.save_anuncio(row)
 
                     time.sleep(random.uniform(0.5, 1.5))
@@ -510,6 +598,9 @@ class OlxScraper:
             "totalAnuncios": self.storage.total_anuncios,
             "detalhesColetados": self.storage.detalhes_coletados,
             "duplicadosRemovidos": self.storage.total_duplicados,
+            "cacheHits": self.storage.cache_hits,
+            "deepRequests": self.storage.deep_requests,
+            "deepErrors": self.storage.deep_errors,
             "cancelled": is_cancelled
         }
 
