@@ -9,6 +9,7 @@ import urllib.parse
 from datetime import datetime, timedelta
 import concurrent.futures
 from pymongo import MongoClient
+from services.correlation_service import aplicar_termos_negativos, remover_outliers
 try:
     import redis
 except ImportError:
@@ -325,6 +326,26 @@ class StorageManager:
             except Exception as e:
                 print(f"Erro ao salvar no MongoDB: {e}")
 
+    def save_discarded(self, row, motivo):
+        """Salva o anúncio descartado para fins de auditoria"""
+        if self.mongo_client and row.get('list_id'):
+            try:
+                now = datetime.now()
+                doc = row.copy()
+                doc["status"] = "filtered_out"
+                doc["motivoDescarte"] = motivo
+                doc["lastSeenAt"] = now.isoformat()
+                if self.job_id:
+                    doc["lastExtractionId"] = self.job_id
+                
+                self.anuncios_col.update_one(
+                    {"list_id": row['list_id']},
+                    {"$set": doc, "$setOnInsert": {"firstSeenAt": now.isoformat()}},
+                    upsert=True
+                )
+            except Exception:
+                pass
+
     def update_job_status(self, status_info):
         """Atualiza o documento do job na memória efêmera (Redis)."""
         if self.job_id and self.redis_client:
@@ -419,8 +440,15 @@ class OlxScraper:
         
         paginas_vazias = 0
         is_cancelled = False
+        todos_basicos = []
+        total_basicos = 0
+        total_descartados = 0
+        total_validos = 0
 
         try:
+            # ====================================================================
+            # FASE 1: Coleta Rápida (Apenas Básicos)
+            # ====================================================================
             for i in range(1, self.paginas_busca + 1):
                 if self.check_cancel():
                     print("  [X] Cancelamento detectado. Interrompendo paginação.")
@@ -430,11 +458,11 @@ class OlxScraper:
                 url = self.url_base_template.format(pagina=i)
                 print(f"[BUSCA] Raspando página {i} de {self.paginas_busca}...")
                 
-                progresso_atual = int((i / self.paginas_busca) * 45)
+                progresso_atual = int((i / self.paginas_busca) * 30)
                 self.storage.update_job_status({
                     "status": "scraping",
                     "progress": progresso_atual,
-                    "message": f"Raspando página {i} de {self.paginas_busca} da OLX..."
+                    "message": f"Coletando anúncios básicos: página {i} de {self.paginas_busca}"
                 })
 
                 try:
@@ -460,7 +488,6 @@ class OlxScraper:
                         continue
 
                     paginas_vazias = 0
-                    anuncios_basicos = []
 
                     for anuncio in anuncios:
                         if not anuncio: continue
@@ -497,82 +524,7 @@ class OlxScraper:
                             'date': data_iso,
                             'dateRaw': data_raw,
                         }
-                        anuncios_basicos.append(row)
-
-                    if self.modo_profundo:
-                        if self.check_cancel():
-                            print("  [X] Cancelamento detectado antes dos detalhes.")
-                            is_cancelled = True
-                            break
-
-                        tarefas_profundas = []
-                        for row in anuncios_basicos:
-                            pode_buscar = (self.limite_detalhes is None or self.storage.detalhes_coletados < self.limite_detalhes)
-                            if not pode_buscar or not row['url']:
-                                row.update({'description': '', 'author': '', 'phone': '', 'detail_status': 'pulado' if not pode_buscar else 'sem_url'})
-                                continue
-                            
-                            cached = self.storage.get_cached_details(row['list_id'])
-                            if cached:
-                                row.update(cached)
-                                self.storage.cache_hits += 1
-                                self.storage.detalhes_coletados += 1
-                            else:
-                                tarefas_profundas.append(row)
-
-                        if tarefas_profundas:
-                            print(f"    [!] Baixando detalhes de {len(tarefas_profundas)} anúncios em paralelo (Cache hits: {self.storage.cache_hits})...")
-                            prog_detalhe = 45 + int((i / self.paginas_busca) * 45)
-                            self.storage.update_job_status({
-                                "status": "details",
-                                "progress": min(prog_detalhe, 90),
-                                "message": f"Extraindo detalhes de {len(tarefas_profundas)} anúncios em paralelo..."
-                            })
-
-                            block_flag = False
-
-                            def fetch_worker(anuncio_row):
-                                nonlocal block_flag
-                                if self.check_cancel() or block_flag:
-                                    return {'description': '', 'author': '', 'phone': '', 'detail_status': 'blocked_or_cancelled'}
-                                
-                                try:
-                                    # Sessão isolada para evitar crash entre threads
-                                    sess = requests.Session(impersonate="chrome120")
-                                    resp = sess.get(anuncio_row['url'], timeout=15)
-                                    
-                                    if resp.status_code in [403, 429]:
-                                        block_flag = True
-                                        return {'description': '', 'author': '', 'phone': '', 'detail_status': 'blocked_or_rate_limited'}
-                                    if resp.status_code != 200:
-                                        return {'description': '', 'author': '', 'phone': '', 'detail_status': str(resp.status_code)}
-                                        
-                                    return OlxParser.parse_deep_details(resp.text)
-                                except Exception as e:
-                                    return {'description': '', 'author': '', 'phone': '', 'detail_status': 'error'}
-
-                            with concurrent.futures.ThreadPoolExecutor(max_workers=3) as executor:
-                                futures = {executor.submit(fetch_worker, row): row for row in tarefas_profundas}
-                                for future in concurrent.futures.as_completed(futures):
-                                    row = futures[future]
-                                    try:
-                                        resultado = future.result()
-                                        row.update(resultado)
-                                        
-                                        if resultado.get('detail_status') in ['200', 'ok']:
-                                            self.storage.detalhes_coletados += 1
-                                            self.storage.deep_requests += 1
-                                        elif resultado.get('detail_status') == 'error':
-                                            self.storage.deep_errors += 1
-                                    except Exception:
-                                        row.update({'description': '', 'author': '', 'phone': '', 'detail_status': 'error'})
-                                        self.storage.deep_errors += 1
-
-                            time.sleep(random.uniform(2, 5))
-
-                    # Salva tudo de forma sequencial na thread principal
-                    for row in anuncios_basicos:
-                        self.storage.save_anuncio(row)
+                        todos_basicos.append(row)
 
                     time.sleep(random.uniform(0.5, 1.5))
 
@@ -583,6 +535,133 @@ class OlxScraper:
                 if is_cancelled:
                     break
 
+            total_basicos = len(todos_basicos)
+
+            # ====================================================================
+            # FASE 2: Limpeza e Inteligência (Motor de Correlação)
+            # ====================================================================
+            anuncios_validos = []
+            if not is_cancelled:
+                self.storage.update_job_status({
+                    "status": "filtering",
+                    "progress": 35,
+                    "message": "Analisando anúncios e removendo falsos positivos..."
+                })
+                
+                anuncios_sem_termos, removidos_termos = aplicar_termos_negativos(todos_basicos)
+                for r in removidos_termos:
+                    self.storage.save_discarded(r, "termo_negativo")
+                    
+                anuncios_validos, outliers = remover_outliers(anuncios_sem_termos)
+                for o in outliers:
+                    self.storage.save_discarded(o, o.get("motivoRemocao", "outlier_preco"))
+
+                total_descartados = len(removidos_termos) + len(outliers)
+                total_validos = len(anuncios_validos)
+                
+                self.storage.update_job_status({
+                    "status": "filtered",
+                    "progress": 40,
+                    "message": f"Filtro aplicado: {total_basicos} coletados, {total_descartados} descartados, {total_validos} válidos"
+                })
+
+            # ====================================================================
+            # FASE 3: Modo Profundo Inteligente (Apenas nos Válidos)
+            # ====================================================================
+            if self.modo_profundo and anuncios_validos and not is_cancelled:
+                if self.check_cancel():
+                    print("  [X] Cancelamento detectado antes dos detalhes.")
+                    is_cancelled = True
+                else:
+                    tarefas_profundas = []
+                    for idx, row in enumerate(anuncios_validos):
+                        pode_buscar = (self.limite_detalhes is None or self.storage.detalhes_coletados < self.limite_detalhes)
+                        if not pode_buscar or not row['url']:
+                            row.update({'description': '', 'author': '', 'phone': '', 'detail_status': 'pulado' if not pode_buscar else 'sem_url'})
+                            continue
+                        
+                        cached = self.storage.get_cached_details(row['list_id'])
+                        if cached:
+                            row.update(cached)
+                            self.storage.cache_hits += 1
+                            self.storage.detalhes_coletados += 1
+                        else:
+                            tarefas_profundas.append(row)
+
+                    if tarefas_profundas:
+                        print(f"    [!] Buscando detalhes de {len(tarefas_profundas)} anúncios validados...")
+                        self.storage.update_job_status({
+                            "status": "details",
+                            "progress": 50,
+                            "message": f"Buscando detalhes profundos: {len(tarefas_profundas)} de {total_validos} (Cache: {self.storage.cache_hits})"
+                        })
+
+                        block_flag = False
+
+                        def fetch_worker(anuncio_row):
+                            nonlocal block_flag
+                            if self.check_cancel() or block_flag:
+                                return {'description': '', 'author': '', 'phone': '', 'detail_status': 'blocked_or_cancelled'}
+                            
+                            try:
+                                # Sessão isolada para evitar crash entre threads
+                                sess = requests.Session(impersonate="chrome120")
+                                resp = sess.get(anuncio_row['url'], timeout=15)
+                                
+                                if resp.status_code in [403, 429]:
+                                    block_flag = True
+                                    return {'description': '', 'author': '', 'phone': '', 'detail_status': 'blocked_or_rate_limited'}
+                                if resp.status_code != 200:
+                                    return {'description': '', 'author': '', 'phone': '', 'detail_status': str(resp.status_code)}
+                                    
+                                return OlxParser.parse_deep_details(resp.text)
+                            except Exception as e:
+                                return {'description': '', 'author': '', 'phone': '', 'detail_status': 'error'}
+
+                        with concurrent.futures.ThreadPoolExecutor(max_workers=3) as executor:
+                            futures = {executor.submit(fetch_worker, row): row for row in tarefas_profundas}
+                            concluidos = 0
+                            total_tarefas = len(tarefas_profundas)
+                            
+                            for future in concurrent.futures.as_completed(futures):
+                                row = futures[future]
+                                try:
+                                    resultado = future.result()
+                                    row.update(resultado)
+                                    
+                                    if resultado.get('detail_status') in ['200', 'ok']:
+                                        self.storage.detalhes_coletados += 1
+                                        self.storage.deep_requests += 1
+                                    elif resultado.get('detail_status') == 'error':
+                                        self.storage.deep_errors += 1
+                                except Exception:
+                                    row.update({'description': '', 'author': '', 'phone': '', 'detail_status': 'error'})
+                                    self.storage.deep_errors += 1
+                                    
+                                concluidos += 1
+                                if concluidos % 5 == 0 or concluidos == total_tarefas:
+                                    pct = 50 + int((concluidos / total_tarefas) * 40)
+                                    self.storage.update_job_status({
+                                        "status": "details",
+                                        "progress": min(pct, 90),
+                                        "message": f"Processando detalhes: {concluidos}/{total_tarefas} (Cache: {self.storage.cache_hits})"
+                                    })
+
+                        time.sleep(random.uniform(2, 5))
+
+            # ====================================================================
+            # FASE 4: Persistência Final (Somente Válidos)
+            # ====================================================================
+            if not is_cancelled:
+                self.storage.update_job_status({
+                    "status": "saving",
+                    "progress": 90,
+                    "message": "Gerando CSV, JSONL e persistindo no banco..."
+                })
+                # Caso modo_profundo seja false, anúncios_validos terão só dados básicos.
+                for row in anuncios_validos:
+                    self.storage.save_anuncio(row)
+
         finally:
             self.storage.close()
 
@@ -590,11 +669,14 @@ class OlxScraper:
         if is_cancelled:
             self.storage.update_job_status({"status": "cancelled", "progress": 100, "message": "Extração cancelada pelo usuário"})
         else:
-            self.storage.update_job_status({"progress": 90, "message": "Finalizando scraper..."})
+            self.storage.update_job_status({"progress": 100, "message": "Gerando CSV, JSONL e persistindo no banco..."})
             
         return {
             "csv_file": self.storage.arquivo_csv,
             "jsonl_file": self.storage.arquivo_json,
+            "totalBasicosColetados": total_basicos,
+            "anunciosDescartadosPeloFiltro": total_descartados,
+            "anunciosValidos": total_validos,
             "totalAnuncios": self.storage.total_anuncios,
             "detalhesColetados": self.storage.detalhes_coletados,
             "duplicadosRemovidos": self.storage.total_duplicados,
