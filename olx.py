@@ -351,6 +351,16 @@ class OlxScraper:
 
         self.storage = StorageManager(termo_busca, estado_nome, modo_profundo, job_id, db_client, redis_client)
 
+    def check_cancel(self):
+        """Verifica se o usuário requisitou o cancelamento deste job."""
+        if self.storage.redis_client and self.job_id:
+            try:
+                if self.storage.redis_client.get(f"job:{self.job_id}:cancel"):
+                    return True
+            except:
+                pass
+        return False
+
     def scrape_deep_details(self, url, title):
         """Entra na página individual do anúncio para extrair telefone e descrição."""
         print(f"    [>>] Detalhe [{self.storage.detalhes_coletados + 1}] {title[:50]}...")
@@ -380,9 +390,15 @@ class OlxScraper:
         print("=" * 60)
         
         paginas_vazias = 0
+        is_cancelled = False
 
         try:
             for i in range(1, self.paginas_busca + 1):
+                if self.check_cancel():
+                    print("  [X] Cancelamento detectado. Interrompendo paginação.")
+                    is_cancelled = True
+                    break
+
                 url = self.url_base_template.format(pagina=i)
                 print(f"[BUSCA] Raspando página {i} de {self.paginas_busca}...")
                 
@@ -454,6 +470,11 @@ class OlxScraper:
                         }
 
                         if self.modo_profundo:
+                            if self.check_cancel():
+                                print("  [X] Cancelamento detectado antes dos detalhes.")
+                                is_cancelled = True
+                                break
+
                             pode_buscar = (self.limite_detalhes is None or self.storage.detalhes_coletados < self.limite_detalhes)
                             if pode_buscar and row['url']:
                                 detalhes = self.scrape_deep_details(row['url'], row['title'])
@@ -470,18 +491,26 @@ class OlxScraper:
                 except Exception as e:
                     print(f"  [X] Erro na página {i}: {e}")
                     time.sleep(random.uniform(2, 5))
+                    
+                if is_cancelled:
+                    break
 
         finally:
             self.storage.close()
 
         # Status Final
-        self.storage.update_job_status({"progress": 90, "message": "Finalizando scraper..."})
+        if is_cancelled:
+            self.storage.update_job_status({"status": "cancelled", "progress": 100, "message": "Extração cancelada pelo usuário"})
+        else:
+            self.storage.update_job_status({"progress": 90, "message": "Finalizando scraper..."})
+            
         return {
             "csv_file": self.storage.arquivo_csv,
             "jsonl_file": self.storage.arquivo_json,
             "totalAnuncios": self.storage.total_anuncios,
             "detalhesColetados": self.storage.detalhes_coletados,
-            "duplicadosRemovidos": self.storage.total_duplicados
+            "duplicadosRemovidos": self.storage.total_duplicados,
+            "cancelled": is_cancelled
         }
 
 

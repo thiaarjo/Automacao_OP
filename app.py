@@ -52,6 +52,7 @@ class ExtractRequest(BaseModel):
     paginasBusca: int = 5
     modoProfundo: bool = True
     limiteDetalhes: int = 50
+    pegarTodosDetalhes: bool = False
 
 
 def _serialize_datetime(doc):
@@ -73,12 +74,20 @@ def _get_anuncios_for_job(job_id: str):
             d["listId"] = d.pop("list_id")
         if "detail_status" in d:
             d["detailStatus"] = d.pop("detail_status")
+        if "author" in d:
+            d["vendedor"] = d.pop("author")
+        if "phone" in d:
+            d["telefone"] = d.pop("phone")
+        if "description" in d:
+            d["descricao"] = d.pop("description")
             
     return docs
 
 
 def run_extraction_task(req: ExtractRequest, job_id: str):
     now = datetime.now()
+
+    limite = 999999 if req.pegarTodosDetalhes else req.limiteDetalhes
 
     if redis_client:
         redis_client.hset(f"job:{job_id}", mapping={
@@ -98,7 +107,8 @@ def run_extraction_task(req: ExtractRequest, job_id: str):
                 "estado": req.estado,
                 "paginasBusca": req.paginasBusca,
                 "modoProfundo": req.modoProfundo,
-                "limiteDetalhes": req.limiteDetalhes,
+                "limiteDetalhes": limite,
+                "pegarTodosDetalhes": req.pegarTodosDetalhes,
                 "createdAt": now.isoformat()
             }},
             upsert=True
@@ -111,29 +121,32 @@ def run_extraction_task(req: ExtractRequest, job_id: str):
             estado=req.estado,
             paginas_busca=req.paginasBusca,
             modo_profundo=req.modoProfundo,
-            limite_detalhes=req.limiteDetalhes,
+            limite_detalhes=limite,
             job_id=job_id,
             redis_conn=redis_client
         )
         csv_file = result.get("csv_file")
 
-        # 2. Atualiza status para geração
-        if redis_client:
-            redis_client.hset(f"job:{job_id}", mapping={
-                "status": "generating",
-                "progress": "90",
-                "message": "Gerando arquivos CSV compatíveis com Excel..."
-            })
-            
-        if mongo_client:
-            extractions_col.update_one(
-                {"job_id": job_id},
-                {"$set": {
+        # 2. Atualiza status para geração se não foi cancelado
+        is_cancelled = result.get("cancelled", False)
+        
+        if not is_cancelled:
+            if redis_client:
+                redis_client.hset(f"job:{job_id}", mapping={
                     "status": "generating",
-                    "progress": 90,
+                    "progress": "90",
                     "message": "Gerando arquivos CSV compatíveis com Excel..."
-                }}
-            )
+                })
+                
+            if mongo_client:
+                extractions_col.update_one(
+                    {"job_id": job_id},
+                    {"$set": {
+                        "status": "generating",
+                        "progress": 90,
+                        "message": "Gerando arquivos CSV compatíveis com Excel..."
+                    }}
+                )
 
         # 3. Gera o Excel
         excel_file = gerar_excel(csv_file)
@@ -146,12 +159,15 @@ def run_extraction_task(req: ExtractRequest, job_id: str):
             redis_client.delete(f"job:{job_id}")
 
         if mongo_client:
+            status_final = "cancelled" if is_cancelled else "completed"
+            msg_final = "Extração cancelada pelo usuário" if is_cancelled else "Extração concluída com sucesso"
+            
             extractions_col.update_one(
                 {"job_id": job_id},
                 {"$set": {
-                    "status": "completed",
+                    "status": status_final,
                     "progress": 100,
-                    "message": "Extração concluída com sucesso",
+                    "message": msg_final,
                     "totalAnuncios": result.get("totalAnuncios", 0),
                     "detalhesColetados": result.get("detalhesColetados", 0),
                     "duplicadosRemovidos": result.get("duplicadosRemovidos", 0),
@@ -187,10 +203,26 @@ def run_extraction_task(req: ExtractRequest, job_id: str):
 @app.get("/health")
 @app.get("/api/health")
 def health_check():
+    # Checagem dinâmica
+    redis_ok = False
+    if redis_client:
+        try:
+            redis_ok = redis_client.ping()
+        except:
+            pass
+            
+    mongo_ok = False
+    if mongo_client:
+        try:
+            mongo_client.admin.command('ping')
+            mongo_ok = True
+        except:
+            pass
+
     return {
-        "status": "ok",
-        "mongo": "connected" if mongo_connected else "disconnected",
-        "redis": "connected" if redis_connected else "disconnected",
+        "status": "ok" if redis_ok and mongo_ok else "degraded",
+        "mongo": "connected" if mongo_ok else "disconnected",
+        "redis": "connected" if redis_ok else "disconnected",
         "service": "olx-extractor-api"
     }
 
@@ -237,6 +269,41 @@ def start_extraction(req: ExtractRequest, background_tasks: BackgroundTasks):
         "status": "queued",
         "message": "Extração iniciada"
     }
+
+
+# =============================================================================
+# RE-EXECUTAR EXTRAÇÃO
+# =============================================================================
+@app.post("/extract/{job_id}/retry")
+@app.post("/api/extract/{job_id}/retry")
+def retry_extraction(job_id: str, background_tasks: BackgroundTasks):
+    if not mongo_client:
+        raise HTTPException(status_code=500, detail="MongoDB offline")
+    job = extractions_col.find_one({"job_id": job_id}, {"_id": 0})
+    if not job:
+        raise HTTPException(status_code=404, detail="Job original não encontrado")
+    
+    req = ExtractRequest(
+        termoBusca=job.get("termoBusca", ""),
+        estado=job.get("estado", ""),
+        paginasBusca=job.get("paginasBusca", 5),
+        modoProfundo=job.get("modoProfundo", True),
+        limiteDetalhes=job.get("limiteDetalhes", 50),
+        pegarTodosDetalhes=job.get("pegarTodosDetalhes", False)
+    )
+    return start_extraction(req, background_tasks)
+
+
+# =============================================================================
+# CANCELAR EXTRAÇÃO
+# =============================================================================
+@app.post("/extract/{job_id}/cancel")
+@app.post("/api/extract/{job_id}/cancel")
+def cancel_extraction(job_id: str):
+    if redis_client:
+        redis_client.setex(f"job:{job_id}:cancel", 86400, "1")
+        return {"job_id": job_id, "status": "cancelling", "message": "Cancelamento solicitado"}
+    return {"error": "Redis indisponível"}
 
 
 # =============================================================================
@@ -296,8 +363,8 @@ def get_status(job_id: str):
     if not job:
         raise HTTPException(status_code=404, detail="Job não encontrado")
 
-    # Quando finalizado, inclui a lista completa de anúncios
-    if job.get("status") == "completed":
+    # Quando finalizado ou cancelado, inclui a lista completa de anúncios
+    if job.get("status") in ["completed", "cancelled"]:
         job["anuncios"] = _get_anuncios_for_job(job_id)
 
     return job
@@ -308,16 +375,25 @@ def get_status(job_id: str):
 # =============================================================================
 @app.get("/extractions")
 @app.get("/api/extractions")
-def list_extractions():
-    """Retorna o histórico das últimas 50 extrações."""
+def list_extractions(skip: int = 0, limit: int = 50):
+    """Retorna o histórico das últimas extrações com paginação."""
     if not mongo_client:
         raise HTTPException(status_code=500, detail="MongoDB não conectado")
 
-    jobs = list(extractions_col.find({}, {"_id": 0}).sort("createdAt", -1).limit(50))
+    limit = min(limit, 200)
+    total = extractions_col.count_documents({})
+    jobs = list(extractions_col.find({}, {"_id": 0}).sort("createdAt", -1).skip(skip).limit(limit))
+    
     for j in jobs:
         # Indica ao frontend se existem anúncios disponíveis para essa extração
         j["hasAnuncios"] = anuncios_col.count_documents({"extractionIds": j.get("job_id")}) > 0
-    return jobs
+        
+    return {
+        "items": jobs,
+        "total": total,
+        "skip": skip,
+        "limit": limit
+    }
 
 
 # =============================================================================
@@ -360,6 +436,51 @@ def get_extraction_anuncios(job_id: str):
         raise HTTPException(status_code=404, detail="Extração não encontrada")
 
     return _get_anuncios_for_job(job_id)
+
+
+# =============================================================================
+# DELETAR EXTRAÇÃO DO HISTÓRICO
+# =============================================================================
+@app.delete("/extractions/{job_id}")
+@app.delete("/api/extractions/{job_id}")
+def delete_extraction(job_id: str):
+    """Exclui um job do banco de dados e remove suas referências."""
+    if not mongo_client:
+        raise HTTPException(status_code=500, detail="MongoDB offline")
+        
+    # Remove do histórico
+    extractions_col.delete_one({"job_id": job_id})
+    
+    # Remove a tag de extractionIds de todos os anúncios associados
+    anuncios_col.update_many({"extractionIds": job_id}, {"$pull": {"extractionIds": job_id}})
+    # Apaga anúncios que ficaram órfãos (não pertencem a nenhuma extração)
+    anuncios_col.delete_many({"extractionIds": {"$size": 0}})
+    
+    # Remove do histórico de preços
+    price_history_col.delete_many({"job_id": job_id})
+    
+    # Remove qualquer vestígio do Redis
+    if redis_client:
+        redis_client.delete(f"job:{job_id}")
+        redis_client.delete(f"job:{job_id}:cancel")
+        
+    return {"status": "deleted", "message": "Extração removida com sucesso"}
+
+
+# =============================================================================
+# LOG DE ERROS DO CLIENTE (Frontend)
+# =============================================================================
+@app.post("/client-errors")
+@app.post("/api/client-errors")
+def log_client_error(payload: dict):
+    """Registra erros do frontend no arquivo client_errors.log"""
+    try:
+        import json
+        with open("client_errors.log", "a", encoding="utf-8") as f:
+            f.write(json.dumps(payload, ensure_ascii=False) + "\n")
+    except: 
+        pass
+    return {"status": "logged"}
 
 
 # =============================================================================
