@@ -9,6 +9,7 @@ from pymongo import MongoClient
 
 from olx import scrape_olx
 from gerar_excel import gerar_excel
+from services.correlation_service import gerar_dossie_correlacionado
 
 app = FastAPI(title="OLX Extractor API")
 
@@ -30,6 +31,13 @@ try:
     anuncios_col = db["anuncios"]
     price_history_col = db["price_history"]
     mongo_connected = True
+
+    # Cria índice textual para buscas correlacionadas (idempotente)
+    try:
+        anuncios_col.create_index([("title", "text"), ("description", "text")], name="idx_text_busca")
+    except Exception:
+        pass  # Índice já existe ou erro não-crítico
+
 except Exception as e:
     print(f"Erro ao conectar no MongoDB em app.py: {e}")
     mongo_client = None
@@ -436,6 +444,44 @@ def get_extraction_anuncios(job_id: str):
         raise HTTPException(status_code=404, detail="Extração não encontrada")
 
     return _get_anuncios_for_job(job_id)
+
+
+# =============================================================================
+# MOTOR DE CORRELAÇÃO E CONSOLIDAÇÃO (Sem IA)
+# =============================================================================
+@app.get("/anuncios/correlacionados")
+@app.get("/api/anuncios/correlacionados")
+def correlacionar_anuncios(
+    termo: str,
+    estado: str = None,
+    preco_min: float = None,
+    preco_max: float = None,
+    excluir_termos: str = None
+):
+    """
+    Busca, filtra, agrupa e consolida todos os anúncios do banco
+    relacionados ao termo pesquisado. Retorna um dossiê JSON completo.
+    A IA NÃO participa dessa etapa — tudo é feito via código.
+    """
+    if not mongo_client:
+        raise HTTPException(status_code=500, detail="MongoDB não conectado")
+
+    # Converte string CSV de termos extras em lista
+    termos_extras = None
+    if excluir_termos:
+        termos_extras = [t.strip() for t in excluir_termos.split(",") if t.strip()]
+
+    dossie = gerar_dossie_correlacionado(
+        anuncios_col=anuncios_col,
+        price_history_col=price_history_col,
+        termo=termo,
+        estado=estado,
+        preco_min=preco_min,
+        preco_max=preco_max,
+        excluir_termos_extras=termos_extras
+    )
+
+    return dossie
 
 
 # =============================================================================
