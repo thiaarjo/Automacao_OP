@@ -456,7 +456,8 @@ def correlacionar_anuncios(
     estado: str = None,
     preco_min: float = None,
     preco_max: float = None,
-    excluir_termos: str = None
+    excluir_termos: str = None,
+    _termos: str = None
 ):
     """
     Busca, filtra, agrupa e consolida todos os anúncios do banco
@@ -468,8 +469,9 @@ def correlacionar_anuncios(
 
     # Converte string CSV de termos extras em lista
     termos_extras = None
-    if excluir_termos:
-        termos_extras = [t.strip() for t in excluir_termos.split(",") if t.strip()]
+    termos_raw = excluir_termos or _termos
+    if termos_raw:
+        termos_extras = [t.strip() for t in termos_raw.split(",") if t.strip()]
 
     dossie = gerar_dossie_correlacionado(
         anuncios_col=anuncios_col,

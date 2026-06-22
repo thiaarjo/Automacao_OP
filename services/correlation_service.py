@@ -294,7 +294,7 @@ def gerar_insights_tecnicos(estatisticas: dict, vendedores: list, historico: lis
 
     total = estatisticas.get("totalAnunciosCorrelacionados", 0)
     if total == 0:
-        insights.append({"tipo": "aviso", "mensagem": "Nenhum anúncio encontrado para este termo após filtragem."})
+        insights.append({"tipo": "risco", "mensagem": "Nenhum anúncio encontrado para este termo após filtragem.", "severidade": "alta"})
         return insights
 
     # Insight 1: Concentração de mercado
@@ -304,8 +304,8 @@ def gerar_insights_tecnicos(estatisticas: dict, vendedores: list, historico: lis
         pct = round((total_lojistas_ads / total) * 100, 1)
         insights.append({
             "tipo": "mercado",
-            "mensagem": f"{len(lojistas)} possível(is) lojista(s) detectado(s), "
-                        f"responsáveis por {total_lojistas_ads} anúncios ({pct}% do total)."
+            "mensagem": f"{len(lojistas)} possível(is) lojista(s) detectado(s), responsáveis por {total_lojistas_ads} anúncios ({pct}% do total).",
+            "severidade": "media"
         })
 
     # Insight 2: Dispersão de preço
@@ -316,13 +316,14 @@ def gerar_insights_tecnicos(estatisticas: dict, vendedores: list, historico: lis
         if cv > 30:
             insights.append({
                 "tipo": "preco",
-                "mensagem": f"Alta dispersão de preços detectada (CV={cv:.1f}%). "
-                            f"Pode indicar variações de estado de conservação ou modelos diferentes."
+                "mensagem": f"Alta dispersão de preços detectada (CV={cv:.1f}%). Pode indicar variações de estado de conservação ou modelos diferentes.",
+                "severidade": "media"
             })
         elif cv < 10:
             insights.append({
-                "tipo": "preco",
-                "mensagem": f"Preços muito uniformes (CV={cv:.1f}%). Mercado estável para este item."
+                "tipo": "oportunidade",
+                "mensagem": f"Preços muito uniformes (CV={cv:.1f}%). Mercado estável para este item.",
+                "severidade": "baixa"
             })
 
     # Insight 3: Tendência de preço
@@ -331,19 +332,22 @@ def gerar_insights_tecnicos(estatisticas: dict, vendedores: list, historico: lis
     if len(tendencias_queda) > len(tendencias_alta) and tendencias_queda:
         insights.append({
             "tipo": "tendencia",
-            "mensagem": f"Tendência de queda: {len(tendencias_queda)} anúncios tiveram redução de preço > 5%."
+            "mensagem": f"Tendência de queda: {len(tendencias_queda)} anúncios tiveram redução de preço > 5%.",
+            "severidade": "baixa"
         })
     elif len(tendencias_alta) > len(tendencias_queda) and tendencias_alta:
         insights.append({
             "tipo": "tendencia",
-            "mensagem": f"Tendência de alta: {len(tendencias_alta)} anúncios tiveram aumento de preço > 5%."
+            "mensagem": f"Tendência de alta: {len(tendencias_alta)} anúncios tiveram aumento de preço > 5%.",
+            "severidade": "media"
         })
 
     # Insight 4: Outliers removidos
     if outliers:
         insights.append({
             "tipo": "limpeza",
-            "mensagem": f"{len(outliers)} anúncio(s) removido(s) como outlier(s) ou falso(s) positivo(s)."
+            "mensagem": f"{len(outliers)} anúncio(s) removido(s) como outlier(s) ou falso(s) positivo(s).",
+            "severidade": "baixa"
         })
 
     return insights
@@ -378,10 +382,21 @@ def gerar_dossie_correlacionado(
     # Junta todos os removidos para transparência
     todos_outliers = []
     for r in removidos_termo:
-        r["motivoRemocao"] = "termo negativo detectado"
-        todos_outliers.append({"title": r.get("title"), "price": r.get("price"), "motivo": "termo negativo"})
+        todos_outliers.append({
+            "title": r.get("title", ""), 
+            "price": r.get("price", 0), 
+            "motivo": "termo negativo detectado",
+            "city": r.get("city", ""),
+            "state": r.get("state", "")
+        })
     for o in outliers:
-        todos_outliers.append({"title": o.get("title"), "price": o.get("price"), "motivo": o.get("motivoRemocao", "outlier")})
+        todos_outliers.append({
+            "title": o.get("title", ""), 
+            "price": o.get("price", 0), 
+            "motivo": o.get("motivoRemocao", "outlier"),
+            "city": o.get("city", ""),
+            "state": o.get("state", "")
+        })
 
     # 4. Estatísticas
     stats = calcular_estatisticas(anuncios_validos)
